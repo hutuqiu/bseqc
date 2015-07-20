@@ -1,0 +1,153 @@
+#!/usr/bin/python
+
+# ------------------------------------
+#python package
+# ------------------------------------
+from collections import defaultdict
+import sys
+import logging
+
+# ------------------------------------
+#own python modules
+# ------------------------------------
+from BSeQC.qc_filter import paired_filter as PF
+
+# ------------------------------------
+#logging object
+# ------------------------------------
+
+logging.basicConfig(level=20,
+                    format=' %(levelname)-5s @ %(asctime)s: %(message)s ',
+                    datefmt='%a, %d %b %Y %H:%M:%S',
+                    stream=sys.stderr,
+                    filemode="w"
+)
+info = logging.info
+error = logging.error
+warning = logging.warning
+
+
+def rrbs_trim(read, read_info, site_meth_list, single_on, remove_overlap, record_mate, filter_MspI_end_repaired_bp,
+              filter_remove_overlap_bp, out):
+    if single_on:
+        strand, chr, pos1, CIGAR, seq, score = read_info[1], read_info[2], int(read_info[3]) - 1, read_info[4], \
+                                               read_info[5], read_info[6]
+        pos_list = [pos1]
+    else:
+        strand, chr, pos1, CIGAR, pos2, insert, seq, score = \
+            read_info[1], read_info[2], int(read_info[3]) - 1, read_info[4], int(read_info[5]) - 1, abs(
+                int(read_info[6])), read_info[7], read_info[8]
+        if pos2 < pos1 and (strand == '++' or strand == '--') or (pos1 < pos2 and (strand == '+-' or strand == '-+')):
+            out.write(read)
+            return record_mate, filter_MspI_end_repaired_bp, filter_remove_overlap_bp
+        pos_list = [pos1, pos2]
+    reverse_strand = ['-+', '+-']
+    original_read_info = read.rstrip().split('\t')
+
+    seq, score, CIGAR, pos_list = get_filted_info(strand, seq, score, CIGAR, site_meth_list, single_on, reverse_strand,
+                                                  filter_MspI_end_repaired_bp, pos_list)
+
+    ##output the trimming result
+    if single_on:
+        pos1 = pos_list[0]
+        out.write('%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s'
+                  % (original_read_info[0], original_read_info[1], original_read_info[2], pos1, original_read_info[4],
+                     CIGAR, original_read_info[6], original_read_info[7], original_read_info[8], seq, score))
+        for i in range(11, len(original_read_info)):
+            out.write('\t%s' % original_read_info[i])
+        out.write('\n')
+
+    else:
+        #get the original information
+        pos1, pos2 = pos_list[0], pos_list[1]
+        strand, chr, pos1_ori, pos2_ori, insert = \
+            read_info[1], read_info[2], int(read_info[3]) - 1, int(read_info[5]) - 1, abs(int(read_info[6]))
+
+        if strand in reverse_strand:
+            site_information = [chr, str(pos2_ori), str(pos1_ori), str(insert)]  #change pos2 and pos1 in '+-' or '-+'
+        else:
+            site_information = [chr, str(pos1_ori), str(pos2_ori), str(insert)]
+        read_mate_site = '_'.join(site_information)
+        p_dict = {'++': '+-', '+-': '++', '-+': '--', '--': '-+'}
+
+        if not record_mate.has_key(read_mate_site):
+            record_mate[read_mate_site] = [[read, strand, CIGAR, seq, score, pos1, pos2]]
+        else:
+            record_mate[read_mate_site].append([read, strand, CIGAR, seq, score, pos1, pos2])
+            if len(record_mate[read_mate_site]) == 2 and p_dict[record_mate[read_mate_site][0][1]] == \
+                    record_mate[read_mate_site][1][1]:
+                #get the new position
+                for mate in record_mate[read_mate_site]:
+                    if mate[1] not in reverse_strand:
+                        pos1_new = mate[5]
+                        pos2_new = mate[6]
+                        #get new insert
+                for mate in record_mate[read_mate_site]:
+                    if mate[1] in reverse_strand:
+                        insert = pos2_new - pos1_new + len(mate[3])
+
+                for mate in record_mate[read_mate_site]:
+                    read, strand, CIGAR, seq, score = mate[0], mate[1], mate[2], mate[3], mate[4]
+                    if remove_overlap:
+                        if strand not in reverse_strand:
+                            CIGAR, seq, score, filter_remove_overlap_bp = PF.remove_overlap_seq(pos1_new, pos2_new,
+                                                                                                insert, seq, score,
+                                                                                                CIGAR,
+                                                                                                filter_remove_overlap_bp)
+                            if len(seq) == 0:
+                            #In this situation, the two read mates are the same, we should count one time if remove_overlap is True
+                                continue
+                            else:
+                                PF.writer(pos1_new, CIGAR, pos2_new, insert, seq, score, read, out)
+                        else:
+                            PF.writer(pos2_new, CIGAR, pos1_new, -insert, seq, score, read, out)
+                    else:
+                        if strand not in reverse_strand:
+                            PF.writer(pos1_new, CIGAR, pos2_new, insert, seq, score, read, out)
+                        else:
+                            PF.writer(pos2_new, CIGAR, pos1_new, -insert, seq, score, read, out)
+                del record_mate[read_mate_site]
+    return record_mate, filter_MspI_end_repaired_bp, filter_remove_overlap_bp
+
+
+def get_filted_info(strand, seq, score, CIGAR, site_meth_list, single_on, reverse_strand, filter_MspI_end_repaired_bp, pos_list):
+    '''
+    Use the MspI site to trim read
+    '''
+
+    original_read = ['++', '-+'] #single-end or the first mate of paired-end
+    original_len = len(seq)
+
+    if strand in reverse_strand:
+        seq = seq[::-1]
+        score = score[::-1]
+
+    if strand in original_read:
+        #trim the 3' from the second nucleotide of the MspI site to the end
+        readlen = len(seq)
+        seq = seq[:site_meth_list[-1]]
+        score = score[:site_meth_list[-1]]
+        if strand in reverse_strand:
+            if single_on:
+                pos_list[0] = pos_list[0] + (readlen - len(seq))
+            else:
+                pos_list[1] = pos_list[1] + (readlen - len(seq))
+    else:
+        if not single_on:
+        #trim the 5' from start to the the second nucleotide of the MspI site
+            readlen = len(seq)
+            seq = seq[(site_meth_list[-2] + 2):]
+            score = score[(site_meth_list[-2] + 2):]
+            if strand not in reverse_strand:
+                pos_list[0] = pos_list[0] + (readlen - len(seq))
+    pos_list = [i + 1 for i in pos_list]
+
+    if strand in reverse_strand:
+        seq = seq[::-1]
+        score = score[::-1]
+
+    CIGAR = str(len(seq)) + CIGAR[-1]
+    filter_MspI_end_repaired_bp += original_len - len(seq)
+    return seq, score, filter_MspI_end_repaired_bp, CIGAR, pos_list
+
+
